@@ -1,0 +1,440 @@
+# Eagles Scoring Celebration Package for Home Assistant
+# 
+# This package turns your lights Eagles-green when Philadelphia Eagles score
+# Compatible with Home Assistant OS, stable channel
+# Time zone: America/New_York
+#
+# TARGET LIGHTS (modify as needed):
+# - light.living_room_main
+# - light.kitchen_pendants
+# - light.tv_backlight_govee
+#
+# EAGLES GREEN COLOR: #004C54 (RGB 0,76,84; HSV 186°, 100%, 33%)
+#
+# SCORING EVENTS: touchdown, field goal, safety, two-point conversion, extra point
+#
+# BEHAVIOR:
+# - If lights off: pulse green 15s at 80% brightness, return to off
+# - If lights on: flash green 15s at +15% brightness (max 100%), restore exact state
+# - 45s cooldown between triggers
+# - Manual DND override via input_boolean.do_not_disturb
+#
+# INSTALLATION: 
+# 1. Place this file in your Home Assistant packages/ directory
+# 2. Restart Home Assistant
+# 3. Install the "NFL" integration from HACS (for Option A) OR setup webhook (Option B)
+# 4. Customize entity names and colors below as needed
+
+###############################################################################
+# INPUT HELPERS
+###############################################################################
+
+input_boolean:
+  # Manual override to disable all Eagles celebrations
+  do_not_disturb:
+    name: "Do Not Disturb Mode"
+    icon: mdi:bell-off
+    initial: false
+
+  # Dry run mode - logs what would happen without changing lights
+  eagles_dry_run:
+    name: "Eagles Celebration Dry Run"
+    icon: mdi:eye
+    initial: false
+
+input_number:
+  # Cooldown period between score celebrations (seconds)
+  eagles_cooldown_seconds:
+    name: "Eagles Celebration Cooldown"
+    min: 15
+    max: 300
+    step: 5
+    initial: 45
+    unit_of_measurement: "s"
+    icon: mdi:timer
+
+  # Celebration duration (seconds)
+  eagles_celebration_duration:
+    name: "Eagles Celebration Duration"
+    min: 5
+    max: 60
+    step: 5
+    initial: 15
+    unit_of_measurement: "s"
+    icon: mdi:timer-play
+
+input_button:
+  # Test button to manually trigger Eagles celebration
+  test_eagles_celebration:
+    name: "Test Eagles Celebration"
+    icon: mdi:football
+
+input_datetime:
+  # Tracks last celebration time for cooldown logic
+  eagles_last_celebration:
+    name: "Eagles Last Celebration"
+    has_date: true
+    has_time: true
+
+###############################################################################
+# SCRIPTS
+###############################################################################
+
+script:
+  # Main celebration script - handles state preservation and light effects
+  eagles_celebrate_score:
+    alias: "Eagles Score Celebration"
+    description: "Flashes lights Eagles green when Eagles score"
+    fields:
+      duration_seconds:
+        description: "How long to run the celebration (seconds)"
+        default: 15
+        selector:
+          number:
+            min: 5
+            max: 60
+      day_brightness:
+        description: "Brightness for daytime celebrations (0-100)"
+        default: 80
+        selector:
+          number:
+            min: 20
+            max: 100
+      night_brightness:
+        description: "Brightness for nighttime celebrations (0-100)"
+        default: 50
+        selector:
+          number:
+            min: 10
+            max: 80
+      solid_only:
+        description: "Use solid color only (for quiet hours)"
+        default: false
+        selector:
+          boolean:
+    sequence:
+      # Check if dry run mode is enabled
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.eagles_dry_run
+                state: "on"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Eagles Celebration"
+                  message: >
+                    [DRY RUN] Would celebrate Eagles score for {{ duration_seconds }}s 
+                    with {{ day_brightness if now().hour >= 8 and now().hour < 22 else night_brightness }}% brightness
+                    {% if solid_only %} (solid color only){% endif %}
+              - stop: "Dry run mode enabled"
+        default:
+          # Create scene to save current light states
+          - service: scene.create
+            data:
+              scene_id: eagles_lights_restore
+              snapshot_entities:
+                - light.living_room_main
+                - light.kitchen_pendants
+                - light.tv_backlight_govee
+
+          # Determine celebration brightness based on time of day
+          - variables:
+              celebration_brightness: >
+                {{ day_brightness if now().hour >= 8 and now().hour < 22 else night_brightness }}
+              eagles_green_rgb: [0, 76, 84]
+              eagles_green_hs: [186, 100]
+
+          # Log the celebration
+          - service: logbook.log
+            data:
+              name: "Eagles Celebration"
+              message: >
+                🦅 EAGLES SCORED! Celebrating for {{ duration_seconds }}s at {{ celebration_brightness }}% brightness
+                {% if solid_only %} (quiet mode){% endif %}
+
+          # Initial flash sequence for all lights
+          - repeat:
+              for_each:
+                - light.living_room_main
+                - light.kitchen_pendants
+                - light.tv_backlight_govee
+              sequence:
+                - variables:
+                    light_entity: "{{ repeat.item }}"
+                    was_on: "{{ states(repeat.item) == 'on' }}"
+                    current_brightness: "{{ state_attr(repeat.item, 'brightness') | int(128) }}"
+                    enhanced_brightness: >
+                      {% if was_on %}
+                        {{ [100, ((current_brightness / 255 * 100) + 15)] | min }}
+                      {% else %}
+                        {{ celebration_brightness }}
+                      {% endif %}
+                    
+                # Flash sequence - different behavior for quiet vs normal hours
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ solid_only }}"
+                      sequence:
+                        # Solid color for quiet hours
+                        - service: light.turn_on
+                          target:
+                            entity_id: "{{ light_entity }}"
+                          data:
+                            brightness_pct: "{{ enhanced_brightness }}"
+                            hs_color: "{{ eagles_green_hs }}"
+                            transition: 1
+                  default:
+                    # Flashing effect for normal hours (Govee-friendly)
+                    - repeat:
+                        count: 3
+                        sequence:
+                          - service: light.turn_on
+                            target:
+                              entity_id: "{{ light_entity }}"
+                            data:
+                              brightness_pct: "{{ enhanced_brightness }}"
+                              hs_color: "{{ eagles_green_hs }}"
+                              transition: 0.5
+                          - delay:
+                              milliseconds: 700
+                          - choose:
+                              - conditions:
+                                  - condition: template
+                                    value_template: "{{ not was_on }}"
+                                sequence:
+                                  - service: light.turn_off
+                                    target:
+                                      entity_id: "{{ light_entity }}"
+                                    data:
+                                      transition: 0.3
+                            default:
+                              - service: light.turn_on
+                                target:
+                                  entity_id: "{{ light_entity }}"
+                                data:
+                                  brightness_pct: "{{ [enhanced_brightness * 0.3, 10] | max }}"
+                                  hs_color: "{{ eagles_green_hs }}"
+                                  transition: 0.3
+                          - delay:
+                              milliseconds: 300
+
+          # Keep lights in Eagles green for the duration
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ not solid_only }}"
+                sequence:
+                  - service: light.turn_on
+                    target:
+                      entity_id:
+                        - light.living_room_main
+                        - light.kitchen_pendants
+                        - light.tv_backlight_govee
+                    data:
+                      brightness_pct: "{{ celebration_brightness }}"
+                      hs_color: "{{ eagles_green_hs }}"
+                      transition: 1
+                  
+                  # Wait for celebration duration
+                  - delay:
+                      seconds: "{{ duration_seconds - 6 }}"  # Account for flash sequence time
+            default:
+              # For quiet hours, just wait
+              - delay:
+                  seconds: "{{ duration_seconds }}"
+
+          # Restore original light states
+          - service: scene.turn_on
+            target:
+              entity_id: scene.eagles_lights_restore
+            data:
+              transition: 2
+
+          # Update last celebration timestamp
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.eagles_last_celebration
+            data:
+              datetime: "{{ now().isoformat() }}"
+
+  # Extended celebration for Eagles wins
+  eagles_celebrate_win:
+    alias: "Eagles Win Celebration"
+    description: "Extended celebration when Eagles win the game"
+    sequence:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.eagles_dry_run
+                state: "on"
+            sequence:
+              - service: logbook.log
+                data:
+                  name: "Eagles Win Celebration"
+                  message: "[DRY RUN] Would run extended Eagles win celebration for 30s"
+              - stop: "Dry run mode enabled"
+        default:
+          - service: logbook.log
+            data:
+              name: "Eagles Win Celebration"
+              message: "🏆 EAGLES WIN! Running extended celebration!"
+
+          # Run extended celebration
+          - service: script.eagles_celebrate_score
+            data:
+              duration_seconds: 30
+              day_brightness: 90
+              night_brightness: 60
+              solid_only: false
+
+###############################################################################
+# AUTOMATIONS
+###############################################################################
+
+automation:
+  # OPTION A: Native Sports Integration Trigger
+  # Requires NFL integration from HACS: https://github.com/zacs/ha-nfl
+  # After installing, configure for Philadelphia Eagles team
+  - id: eagles_score_native_trigger
+    alias: "Eagles Score - Native Sensor"
+    description: "Triggers celebration when Eagles score (via NFL integration)"
+    # UNCOMMENT THE FOLLOWING LINES AFTER INSTALLING NFL INTEGRATION:
+    trigger:
+      - platform: state
+        entity_id: sensor.nfl_philadelphia_eagles  # Adjust entity_id as needed
+        attribute: team_score
+    # Prevent triggering on HA restart or invalid states
+    condition:
+      - condition: template
+        value_template: >
+          {{ trigger.to_state.state not in ['unknown', 'unavailable', 'none'] }}
+      - condition: template
+        value_template: >
+          {{ trigger.from_state.state not in ['unknown', 'unavailable', 'none'] }}
+      # Only trigger when score actually increases
+      - condition: template
+        value_template: >
+          {{ (trigger.to_state.attributes.team_score | int(0)) > 
+             (trigger.from_state.attributes.team_score | int(0)) }}
+      # Only during active games
+      - condition: template
+        value_template: >
+          {{ trigger.to_state.attributes.game_status | default('') in ['1', '2', '3', '4', 'OT', 'Halftime'] }}
+      # Check DND mode
+      - condition: state
+        entity_id: input_boolean.do_not_disturb
+        state: "off"
+      # Check cooldown period
+      - condition: template
+        value_template: >
+          {% set last_celebration = states('input_datetime.eagles_last_celebration') %}
+          {% if last_celebration in ['unknown', 'unavailable'] %}
+            true
+          {% else %}
+            {% set cooldown_seconds = states('input_number.eagles_cooldown_seconds') | int(45) %}
+            {% set time_diff = (now() - strptime(last_celebration, '%Y-%m-%d %H:%M:%S')).total_seconds() %}
+            {{ time_diff >= cooldown_seconds }}
+          {% endif %}
+    action:
+      - service: script.eagles_celebrate_score
+        data:
+          duration_seconds: "{{ states('input_number.eagles_celebration_duration') | int(15) }}"
+          day_brightness: 80
+          night_brightness: 50
+          solid_only: "{{ now().hour < 8 or now().hour >= 22 }}"
+    mode: single
+
+  # Eagles Win Celebration (works with native sensor)
+  - id: eagles_win_celebration
+    alias: "Eagles Win Celebration"
+    description: "Extended celebration when Eagles win"
+    trigger:
+      - platform: state
+        entity_id: sensor.nfl_philadelphia_eagles  # Adjust entity_id as needed
+        attribute: game_status
+        to: 'Final'
+    condition:
+      # Only if Eagles won (their score > opponent score)
+      - condition: template
+        value_template: >
+          {{ (trigger.to_state.attributes.team_score | int(0)) > 
+             (trigger.to_state.attributes.opponent_score | int(0)) }}
+      - condition: state
+        entity_id: input_boolean.do_not_disturb
+        state: "off"
+    action:
+      - service: script.eagles_celebrate_win
+    mode: single
+
+  # Test Button Automation
+  - id: eagles_test_celebration
+    alias: "Eagles Test Celebration"
+    description: "Manual test of Eagles celebration"
+    trigger:
+      - platform: state
+        entity_id: input_button.test_eagles_celebration
+    action:
+      - service: script.eagles_celebrate_score
+        data:
+          duration_seconds: "{{ states('input_number.eagles_celebration_duration') | int(15) }}"
+          day_brightness: 80
+          night_brightness: 50
+          solid_only: false
+    mode: single
+
+###############################################################################
+# WEBHOOK TRIGGER AUTOMATION (OPTION B - FALLBACK)
+###############################################################################
+# 
+# Uncomment this automation to use webhook triggers instead of native sensor
+# This provides a fallback option if the NFL integration doesn't work
+# or if you prefer to use external services like IFTTT/Zapier
+#
+# - id: eagles_score_webhook_trigger
+#   alias: "Eagles Score - Webhook Trigger"
+#   description: "Triggers celebration via webhook call"
+#   trigger:
+#     - platform: webhook
+#       webhook_id: eagles_scored
+#       allowed_methods:
+#         - POST
+#         - GET
+#   condition:
+#     - condition: state
+#       entity_id: input_boolean.do_not_disturb
+#       state: "off"
+#     # Check cooldown period
+#     - condition: template
+#       value_template: >
+#         {% set last_celebration = states('input_datetime.eagles_last_celebration') %}
+#         {% if last_celebration in ['unknown', 'unavailable'] %}
+#           true
+#         {% else %}
+#           {% set cooldown_seconds = states('input_number.eagles_cooldown_seconds') | int(45) %}
+#           {% set time_diff = (now() - strptime(last_celebration, '%Y-%m-%d %H:%M:%S')).total_seconds() %}
+#           {{ time_diff >= cooldown_seconds }}
+#         {% endif %}
+#   action:
+#     - service: logbook.log
+#       data:
+#         name: "Eagles Webhook"
+#         message: "Received Eagles score webhook: {{ trigger.json }}"
+#     - service: script.eagles_celebrate_score
+#       data:
+#         duration_seconds: "{{ trigger.json.duration | default(states('input_number.eagles_celebration_duration') | int(15)) }}"
+#         day_brightness: 80
+#         night_brightness: 50
+#         solid_only: "{{ now().hour < 8 or now().hour >= 22 }}"
+#   mode: single
+
+###############################################################################
+# SCENES (Auto-created by script, but defining here for completeness)
+###############################################################################
+
+scene:
+  # This scene will be auto-created by the script to store light states
+  # No need to modify this section
+  - name: eagles_lights_restore
+    entities: {}
